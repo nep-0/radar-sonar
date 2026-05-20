@@ -114,7 +114,6 @@ func main() {
 				fmt.Printf("[!] send error: %v\n", err)
 				continue
 			}
-			printReply(client, *wait)
 
 		case line == ":read":
 			out, err := client.ReadFor(*wait)
@@ -132,7 +131,6 @@ func main() {
 				fmt.Printf("[!] send error: %v\n", err)
 				continue
 			}
-			printReply(client, *wait)
 
 		case strings.HasPrefix(line, ":hex "):
 			payload, err := parseHex(strings.TrimSpace(strings.TrimPrefix(line, ":hex ")))
@@ -144,7 +142,6 @@ func main() {
 				fmt.Printf("[!] send error: %v\n", err)
 				continue
 			}
-			printReply(client, *wait)
 
 		case line == "":
 			// Skip empty lines.
@@ -165,7 +162,6 @@ func main() {
 				fmt.Printf("[!] send error: %v\n", err)
 				continue
 			}
-			printReply(client, *wait)
 		}
 	}
 }
