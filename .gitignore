@@ -1,0 +1,6 @@
+*.txt
+
+build
+*.exe
+
+__pycache__
