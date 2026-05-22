@@ -27,6 +27,10 @@ const (
 	dropThresholdMm = 300.0
 	alertPayload    = "HEIGHT_DROP_ALERT"
 	alertQueueSize  = 8
+
+	loRaAddress   = 0xFFFF
+	loRaChannel   = 0
+	loRaNetworkID = 0
 )
 
 type replClient struct {
@@ -115,7 +119,32 @@ func openClient() (*replClient, error) {
 }
 
 func openAlertClient() (*ewm22a.EWM22A, error) {
-	return ewm22a.OpenLoRaTransparent(ewm22aPort, ewm22a.DefaultOptions())
+	client, err := ewm22a.Open(ewm22aPort, ewm22a.DefaultOptions())
+	if err != nil {
+		return nil, err
+	}
+
+	if err := configureLoRa(client); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func configureLoRa(client *ewm22a.EWM22A) error {
+	if _, err := client.SetAddress(loRaAddress); err != nil {
+		return fmt.Errorf("set LoRa address: %w", err)
+	}
+	if _, err := client.SetChannel(loRaChannel); err != nil {
+		return fmt.Errorf("set LoRa channel: %w", err)
+	}
+	if _, err := client.SetNetworkID(loRaNetworkID); err != nil {
+		return fmt.Errorf("set LoRa network ID: %w", err)
+	}
+	if _, err := client.SetModeAndReopen(ewm22a.ModeUARTLoRaBLE); err != nil {
+		return fmt.Errorf("set LoRa transparent mode: %w", err)
+	}
+	return nil
 }
 
 func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, state *readingcache.Cache) {

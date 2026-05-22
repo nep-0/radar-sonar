@@ -22,6 +22,9 @@ const (
 	ModeConfig       = 0
 	ModeUARTLoRaBLE  = 1
 	ModeUARTLoRaWiFi = 4
+
+	TransmissionTransparent = 0
+	TransmissionFixed       = 1
 )
 
 // Options configures an EWM22A serial connection.
@@ -241,6 +244,141 @@ func (e *EWM22A) SetModeAndReopen(mode int) (string, error) {
 		return response, err
 	}
 	return response, nil
+}
+
+// Query reads an AT setting, for example Query("ADDR") sends AT+ADDR=?.
+func (e *EWM22A) Query(name string) (string, error) {
+	if name == "" || strings.ContainsAny(name, "\r\n\t +=?") {
+		return "", fmt.Errorf("invalid AT setting name: %q", name)
+	}
+	return e.Command("AT+" + strings.ToUpper(name) + "=?")
+}
+
+// SetAddress sets the LoRa module address, 0..65535.
+func (e *EWM22A) SetAddress(address int) (string, error) {
+	if err := checkRange("address", address, 0, 65535); err != nil {
+		return "", err
+	}
+	return e.setInt("ADDR", address)
+}
+
+// SetChannel sets the LoRa channel. EWM22A-900BWL22S supports 0..80.
+func (e *EWM22A) SetChannel(channel int) (string, error) {
+	if err := checkRange("channel", channel, 0, 80); err != nil {
+		return "", err
+	}
+	return e.setInt("CHANNEL", channel)
+}
+
+// SetNetworkID sets the LoRa network ID, 0..255.
+func (e *EWM22A) SetNetworkID(networkID int) (string, error) {
+	if err := checkRange("network ID", networkID, 0, 255); err != nil {
+		return "", err
+	}
+	return e.setInt("NETID", networkID)
+}
+
+// SetKey sets the LoRa encryption key, 0..65535.
+func (e *EWM22A) SetKey(key int) (string, error) {
+	if err := checkRange("key", key, 0, 65535); err != nil {
+		return "", err
+	}
+	return e.setInt("KEY", key)
+}
+
+// SetRate sets the LoRa air-rate index, 0..7.
+func (e *EWM22A) SetRate(rate int) (string, error) {
+	if err := checkRange("rate", rate, 0, 7); err != nil {
+		return "", err
+	}
+	return e.setInt("RATE", rate)
+}
+
+// SetPacketLength sets the packet length index: 0=240, 1=128, 2=64, 3=32.
+func (e *EWM22A) SetPacketLength(packet int) (string, error) {
+	if err := checkRange("packet", packet, 0, 3); err != nil {
+		return "", err
+	}
+	return e.setInt("PACKET", packet)
+}
+
+// SetPower sets the LoRa power index, 0..3.
+func (e *EWM22A) SetPower(power int) (string, error) {
+	if err := checkRange("power", power, 0, 3); err != nil {
+		return "", err
+	}
+	return e.setInt("POWER", power)
+}
+
+// SetTransmissionMode sets LoRa transmission mode: 0=transparent, 1=fixed.
+func (e *EWM22A) SetTransmissionMode(mode int) (string, error) {
+	if err := checkRange("transmission mode", mode, 0, 1); err != nil {
+		return "", err
+	}
+	return e.setInt("TRANS", mode)
+}
+
+// SetRouter enables or disables LoRa relay mode.
+func (e *EWM22A) SetRouter(enabled bool) (string, error) {
+	return e.setBool("ROUTER", enabled)
+}
+
+// SetLBT enables or disables Listen Before Talk.
+func (e *EWM22A) SetLBT(enabled bool) (string, error) {
+	return e.setBool("LBT", enabled)
+}
+
+// SetEnvironmentRSSI enables or disables environment RSSI reads.
+func (e *EWM22A) SetEnvironmentRSSI(enabled bool) (string, error) {
+	return e.setBool("ERSSI", enabled)
+}
+
+// SetDataRSSI enables or disables appending RSSI to received UART data.
+func (e *EWM22A) SetDataRSSI(enabled bool) (string, error) {
+	return e.setBool("DRSSI", enabled)
+}
+
+// SetWORRole sets the WOR role, only meaningful in mode 7: 0=receiver, 1=sender.
+func (e *EWM22A) SetWORRole(role int) (string, error) {
+	if err := checkRange("WOR role", role, 0, 1); err != nil {
+		return "", err
+	}
+	return e.setInt("WOR", role)
+}
+
+// SetWORPeriod sets the WOR period index, 0..7.
+func (e *EWM22A) SetWORPeriod(period int) (string, error) {
+	if err := checkRange("WOR period", period, 0, 7); err != nil {
+		return "", err
+	}
+	return e.setInt("WTIME", period)
+}
+
+// SetDelay sets WOR delayed sleep in milliseconds, 0..65535.
+func (e *EWM22A) SetDelay(delayMS int) (string, error) {
+	if err := checkRange("delay", delayMS, 0, 65535); err != nil {
+		return "", err
+	}
+	return e.setInt("DELAY", delayMS)
+}
+
+func (e *EWM22A) setInt(name string, value int) (string, error) {
+	return e.Command(fmt.Sprintf("AT+%s=%d", name, value))
+}
+
+func (e *EWM22A) setBool(name string, enabled bool) (string, error) {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	return e.setInt(name, value)
+}
+
+func checkRange(name string, value, minValue, maxValue int) error {
+	if value < minValue || value > maxValue {
+		return fmt.Errorf("%s must be %d..%d, got %d", name, minValue, maxValue, value)
+	}
+	return nil
 }
 
 // ReadFor reads whatever arrives for up to the given duration.
