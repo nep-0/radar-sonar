@@ -23,6 +23,7 @@ RADAR_TARGET_LEN = 8
 
 DEFAULT_HEIGHT_MM = 0.0
 DEFAULT_OBSTACLE = "left"
+DEFAULT_SONAR_STATUS = "unknown"
 
 
 sonar = UART(
@@ -49,6 +50,7 @@ _radar_buf = bytearray()
 _last_height_mm = DEFAULT_HEIGHT_MM
 _last_obstacle = DEFAULT_OBSTACLE
 _last_radar_targets = []
+_last_sonar_status = DEFAULT_SONAR_STATUS
 
 
 def _millis():
@@ -75,44 +77,55 @@ def _decode_ld2450_value(lo, hi):
 
 
 def _parse_sonar_frames():
-    global _last_height_mm
+    global _last_height_mm, _sonar_buf, _last_sonar_status
 
-    while len(_sonar_buf) >= 4:
-        if _sonar_buf[0] != 0xFF:
-            del _sonar_buf[0]
+    buf = _sonar_buf
+    i = 0
+    limit = len(buf)
+
+    while i + 4 <= limit:
+        if buf[i] != 0xFF:
+            i += 1
             continue
 
-        frame = _sonar_buf[:4]
+        frame = buf[i : i + 4]
         checksum = (frame[0] + frame[1] + frame[2]) & 0xFF
         if checksum != frame[3]:
-            del _sonar_buf[0]
+            i += 1
             continue
 
-        del _sonar_buf[:4]
         distance_mm = (frame[1] << 8) | frame[2]
-        if distance_mm != SONAR_OVERRANGE_MM:
+        if distance_mm == SONAR_OVERRANGE_MM:
+            _last_sonar_status = "overrange"
+        else:
             _last_height_mm = float(distance_mm)
+            _last_sonar_status = "normal"
+        i += 4
+
+    if i:
+        _sonar_buf = bytearray(buf[i:])
 
 
 def _parse_radar_frames():
-    global _last_obstacle, _last_radar_targets
+    global _last_obstacle, _last_radar_targets, _radar_buf
 
-    while len(_radar_buf) >= RADAR_FRAME_LEN:
-        header_at = _radar_buf.find(RADAR_HEADER)
+    buf = _radar_buf
+    i = 0
+
+    while i + RADAR_FRAME_LEN <= len(buf):
+        header_at = buf.find(RADAR_HEADER, i)
         if header_at < 0:
-            keep = min(len(_radar_buf), len(RADAR_HEADER) - 1)
-            del _radar_buf[: len(_radar_buf) - keep]
-            return
-        if header_at > 0:
-            del _radar_buf[:header_at]
-        if len(_radar_buf) < RADAR_FRAME_LEN:
+            keep = min(len(buf), len(RADAR_HEADER) - 1)
+            _radar_buf = bytearray(buf[len(buf) - keep :])
             return
 
-        frame = _radar_buf[:RADAR_FRAME_LEN]
+        if header_at + RADAR_FRAME_LEN > len(buf):
+            break
+
+        frame = buf[header_at : header_at + RADAR_FRAME_LEN]
         if frame[-2:] != RADAR_TRAILER:
-            del _radar_buf[0]
+            i = header_at + 1
             continue
-        del _radar_buf[:RADAR_FRAME_LEN]
 
         targets = []
         offset = len(RADAR_HEADER)
@@ -139,6 +152,11 @@ def _parse_radar_frames():
             _last_radar_targets = targets
             nearest = min(targets, key=lambda target: abs(target["y_mm"]))
             _last_obstacle = "right" if nearest["x_mm"] >= 0 else "left"
+
+        i = header_at + RADAR_FRAME_LEN
+
+    if i:
+        _radar_buf = bytearray(buf[i:])
 
 
 def _update_sonar(timeout_ms=SONAR_READ_TIMEOUT_MS):
@@ -173,6 +191,11 @@ def get_height():
     return _last_height_mm
 
 
+def get_sonar_status():
+    _update_sonar()
+    return _last_sonar_status
+
+
 def get_obstacle():
     _update_radar()
     return _last_obstacle
@@ -181,13 +204,3 @@ def get_obstacle():
 def get_radar_targets():
     _update_radar()
     return _last_radar_targets
-
-
-def main():
-    while True:
-        update()
-        time.sleep_ms(20)
-
-
-if __name__ == "__main__":
-    main()

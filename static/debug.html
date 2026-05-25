@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radar/Sonar Debug</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --ink: #e5e7eb;
+      --muted: #9ca3af;
+      --good: #10b981;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --line: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #0b1222 0%, var(--bg) 100%);
+      color: var(--ink);
+      font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding: 20px;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .card {
+      background: rgba(17, 24, 39, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+    .status-normal { color: var(--good); }
+    .status-overrange { color: var(--warn); }
+    .status-unknown { color: var(--bad); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #020617;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      max-height: 60vh;
+      overflow: auto;
+    }
+    .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    input {
+      width: 110px;
+      background: #020617;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font: inherit;
+    }
+    button {
+      background: #1d4ed8;
+      color: #fff;
+      border: 0;
+      border-radius: 8px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+    .graph-card { margin-bottom: 12px; }
+    .legend { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    canvas {
+      width: 100%;
+      height: auto;
+      background: #020617;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="controls">
+      <label>Poll ms <input id="interval" type="number" min="200" step="100" value="1000"></label>
+      <button id="apply">Apply</button>
+      <span id="net" class="k">starting</span>
+    </div>
+
+    <div class="row">
+      <div class="card"><div class="k">Sonar Status</div><div id="sonarStatus" class="v">-</div></div>
+      <div class="card"><div class="k">Height (mm)</div><div id="height" class="v">-</div></div>
+      <div class="card"><div class="k">Obstacle</div><div id="obstacle" class="v">-</div></div>
+      <div class="card"><div class="k">Radar Targets</div><div id="targets" class="v">-</div></div>
+    </div>
+
+    <div class="row" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
+      <div class="card"><div class="k">API Timestamp</div><div id="updatedAt" class="v" style="font-size:14px;">-</div></div>
+      <div class="card"><div class="k">Last Error</div><div id="lastError" class="v" style="font-size:14px;">-</div></div>
+      <div class="card"><div class="k">RTT</div><div id="rtt" class="v">-</div></div>
+    </div>
+
+    <div class="card graph-card">
+      <div class="k">Radar Graph (X/Y mm)</div>
+      <canvas id="radarGraph" width="900" height="520"></canvas>
+      <div class="legend">Green: within 5m (OK). Red: outside 5m. White cross: radar origin (0,0).</div>
+    </div>
+
+    <pre id="raw">waiting...</pre>
+  </div>
+
+  <script>
+    const el = {
+      sonarStatus: document.getElementById('sonarStatus'),
+      height: document.getElementById('height'),
+      obstacle: document.getElementById('obstacle'),
+      targets: document.getElementById('targets'),
+      updatedAt: document.getElementById('updatedAt'),
+      lastError: document.getElementById('lastError'),
+      raw: document.getElementById('raw'),
+      rtt: document.getElementById('rtt'),
+      net: document.getElementById('net'),
+      interval: document.getElementById('interval'),
+      apply: document.getElementById('apply'),
+      radarGraph: document.getElementById('radarGraph')
+    };
+
+    let timer = null;
+    let intervalMs = 1000;
+    const graph = {
+      maxRangeMm: 8000,
+      okRangeMm: 5000
+    };
+
+    function setStatusClass(status) {
+      el.sonarStatus.className = 'v status-' + status;
+    }
+
+    function drawRadar(targets) {
+      const canvas = el.radarGraph;
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      const cx = w / 2;
+      const cy = h / 2;
+      const margin = 36;
+      const plotRadius = Math.min(w, h) / 2 - margin;
+      const scale = plotRadius / graph.maxRangeMm;
+
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1;
+      for (let i = 1; i <= 4; i += 1) {
+        const r = (plotRadius * i) / 4;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = '#475569';
+      ctx.beginPath();
+      ctx.moveTo(margin, cy);
+      ctx.lineTo(w - margin, cy);
+      ctx.moveTo(cx, margin);
+      ctx.lineTo(cx, h - margin);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, graph.okRangeMm * scale, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = '#e5e7eb';
+      ctx.fillRect(cx - 2, cy - 8, 4, 16);
+      ctx.fillRect(cx - 8, cy - 2, 16, 4);
+
+      const safeTargets = Array.isArray(targets) ? targets : [];
+      for (const t of safeTargets) {
+        const x = Number(t?.x_mm) || 0;
+        const y = Number(t?.y_mm) || 0;
+        const dist = Math.hypot(x, y);
+        const px = cx + x * scale;
+        const py = cy - y * scale;
+        const inRange = dist <= graph.okRangeMm;
+
+        ctx.beginPath();
+        ctx.fillStyle = inRange ? '#10b981' : '#ef4444';
+        ctx.arc(px, py, 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    async function poll() {
+      const start = performance.now();
+      try {
+        const res = await fetch('/status', { cache: 'no-store' });
+        const rtt = Math.round(performance.now() - start);
+        el.rtt.textContent = rtt + ' ms';
+
+        if (!res.ok) {
+          throw new Error('HTTP ' + res.status);
+        }
+
+        const data = await res.json();
+        const sonarStatus = (data?.sonar?.status || 'unknown').toLowerCase();
+
+        el.sonarStatus.textContent = sonarStatus;
+        setStatusClass(sonarStatus === 'normal' || sonarStatus === 'overrange' ? sonarStatus : 'unknown');
+        el.height.textContent = data?.sonar?.height_mm ?? data?.height ?? '-';
+        el.obstacle.textContent = data?.obstacle ?? '-';
+        el.targets.textContent = data?.radar?.target_count ?? (Array.isArray(data?.radar?.targets) ? data.radar.targets.length : '-');
+        el.updatedAt.textContent = data?.updated_at || '-';
+        el.lastError.textContent = data?.last_error || '-';
+        el.raw.textContent = JSON.stringify(data, null, 2);
+        drawRadar(data?.radar?.targets || []);
+        el.net.textContent = 'ok';
+      } catch (err) {
+        el.net.textContent = 'error: ' + err.message;
+      }
+    }
+
+    function restart() {
+      if (timer) clearInterval(timer);
+      poll();
+      timer = setInterval(poll, intervalMs);
+    }
+
+    el.apply.addEventListener('click', () => {
+      const n = Number(el.interval.value);
+      if (!Number.isFinite(n) || n < 200) return;
+      intervalMs = n;
+      restart();
+    });
+
+    restart();
+  </script>
+</body>
+</html>

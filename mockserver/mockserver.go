@@ -15,13 +15,15 @@ func Serve(addr string, obstacle string, height float64) error {
 	snapshot := readingcache.Snapshot{
 		Height:    height,
 		Obstacle:  obstacle,
+		Sonar:     readingcache.SonarData{HeightMM: height},
+		Radar:     readingcache.RadarData{TargetCount: 0, Targets: []readingcache.RadarTarget{}},
 		UpdatedAt: time.Now().UTC(),
 	}
 
 	srv := &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" && r.URL.Path != "/status" {
+			if r.URL.Path != "/" && r.URL.Path != "/status" && r.URL.Path != "/detailed" && r.URL.Path != "/status/detailed" {
 				http.NotFound(w, r)
 				return
 			}

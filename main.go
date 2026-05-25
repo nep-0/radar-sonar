@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,12 +21,11 @@ import (
 )
 
 const (
-	microPythonPort = "/dev/serial/..."
-	ewm22aPort      = "/dev/serial/..."
-	httpAddr        = "127.0.0.1:8080"
+	microPythonPort = "/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_e663b0359723542c-if00"
+	ewm22aPort      = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+	httpAddr        = "0.0.0.0:8080"
 	pollInterval    = 1 * time.Second
-	dropThresholdMm = 300.0
-	alertPayload    = "HEIGHT_DROP_ALERT"
+	alertPayload    = "SONAR_OVERRANGE_TO_NORMAL_ALERT"
 	alertQueueSize  = 8
 
 	loRaAddress   = 0xFFFF
@@ -80,16 +80,27 @@ func main() {
 	go alertLoop(ctx, alertClient, alerts)
 	go pollLoop(ctx, client, alerts, state)
 
-	srv := &http.Server{
-		Addr: httpAddr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" && r.URL.Path != "/status" {
-				http.NotFound(w, r)
-				return
-			}
+	mux := http.NewServeMux()
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		cleanPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
+		switch cleanPath {
+		case "/debug":
+			http.ServeFile(w, r, "static/debug.html")
+			return
+		case "/", "/status", "/detailed", "/status/detailed":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(state.Get())
-		}),
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	})
+
+	srv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -125,13 +136,15 @@ func openAlertClient() (*ewm22a.EWM22A, error) {
 	}
 
 	if err := configureLoRa(client); err != nil {
-		_ = client.Close()
-		return nil, err
+		log.Printf("warning: LoRa startup AT config failed; continuing without reconfiguration: %v", err)
 	}
 	return client, nil
 }
 
 func configureLoRa(client *ewm22a.EWM22A) error {
+	if _, err := client.SetMode(ewm22a.ModeConfig); err != nil {
+		fmt.Printf("set LoRa config mode: %e\n", err)
+	}
 	if _, err := client.SetAddress(loRaAddress); err != nil {
 		return fmt.Errorf("set LoRa address: %w", err)
 	}
@@ -152,18 +165,18 @@ func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, sta
 	defer ticker.Stop()
 
 	var (
-		havePrevious   bool
-		previousHeight float64
+		havePreviousStatus bool
+		previousStatus     string
 	)
 
 	for {
-		currentHeight, ok := updateOnce(client, state)
+		currentStatus, ok := updateOnce(client, state)
 		if ok {
-			if havePrevious && previousHeight-currentHeight > dropThresholdMm {
-				queueAlert(alerts, previousHeight-currentHeight)
+			if havePreviousStatus && previousStatus == "overrange" && currentStatus == "normal" {
+				queueAlert(alerts)
 			}
-			previousHeight = currentHeight
-			havePrevious = true
+			previousStatus = currentStatus
+			havePreviousStatus = true
 		}
 
 		select {
@@ -174,10 +187,10 @@ func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, sta
 	}
 }
 
-func updateOnce(client *replClient, state *readingcache.Cache) (float64, bool) {
+func updateOnce(client *replClient, state *readingcache.Cache) (string, bool) {
 	code := strings.Join([]string{
 		"import json",
-		"print(json.dumps({\"height\": get_height(), \"obstacle\": get_obstacle()}))",
+		"print(json.dumps({\"height\": get_height(), \"sonar_status\": get_sonar_status(), \"obstacle\": get_obstacle(), \"radar_targets\": get_radar_targets()}))",
 	}, "\n")
 
 	stdout, stderr, err := client.exec(code)
@@ -187,15 +200,17 @@ func updateOnce(client *replClient, state *readingcache.Cache) (float64, bool) {
 			LastError: fmt.Sprintf("exec: %v", err),
 		})
 		log.Printf("poll error: %v", err)
-		return 0, false
+		return "", false
 	}
 	if stderr != "" {
 		log.Printf("device stderr: %s", strings.TrimSpace(stderr))
 	}
 
 	var payload struct {
-		Height   float64 `json:"height"`
-		Obstacle string  `json:"obstacle"`
+		Height       float64                    `json:"height"`
+		SonarStatus  string                     `json:"sonar_status"`
+		Obstacle     string                     `json:"obstacle"`
+		RadarTargets []readingcache.RadarTarget `json:"radar_targets"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &payload); err != nil {
 		state.Set(readingcache.Snapshot{
@@ -203,20 +218,27 @@ func updateOnce(client *replClient, state *readingcache.Cache) (float64, bool) {
 			LastError: fmt.Sprintf("decode: %v", err),
 		})
 		log.Printf("poll decode error: %v; raw=%q", err, stdout)
-		return 0, false
+		return "", false
+	}
+
+	status := strings.TrimSpace(payload.SonarStatus)
+	if status == "" {
+		status = "unknown"
 	}
 
 	state.Set(readingcache.Snapshot{
 		Height:    payload.Height,
 		Obstacle:  payload.Obstacle,
+		Sonar:     readingcache.SonarData{HeightMM: payload.Height, Status: status},
+		Radar:     readingcache.RadarData{TargetCount: len(payload.RadarTargets), Targets: payload.RadarTargets},
 		UpdatedAt: time.Now().UTC(),
 		LastError: "",
 	})
-	return payload.Height, true
+	return status, true
 }
 
-func queueAlert(alerts chan<- string, dropMm float64) {
-	message := fmt.Sprintf("%s %s drop=%.1fmm", time.Now().Format("2006-01-02 15:04:05"), alertPayload, dropMm)
+func queueAlert(alerts chan<- string) {
+	message := fmt.Sprintf("%s %s", time.Now().Format("2006-01-02 15:04:05"), alertPayload)
 	select {
 	case alerts <- message:
 	default:
