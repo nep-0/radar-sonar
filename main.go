@@ -142,8 +142,8 @@ func openAlertClient() (*ewm22a.EWM22A, error) {
 }
 
 func configureLoRa(client *ewm22a.EWM22A) error {
-	if _, err := client.SetMode(ewm22a.ModeConfig); err != nil {
-		fmt.Printf("set LoRa config mode: %e\n", err)
+	if _, err := client.SetModeAndReopen(ewm22a.ModeConfig); err != nil {
+		return fmt.Errorf("set LoRa config mode: %w", err)
 	}
 	if _, err := client.SetAddress(loRaAddress); err != nil {
 		return fmt.Errorf("set LoRa address: %w", err)

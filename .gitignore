@@ -2,5 +2,6 @@
 
 build
 *.exe
+radar-sonar
 
 __pycache__
