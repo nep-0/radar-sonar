@@ -2,6 +2,7 @@ package ewm22a
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 const (
 	readBufSize = 1024
+	readPoll    = 50 * time.Millisecond
 
 	DefaultBaud       = 115200
 	DefaultTimeout    = 5 * time.Second
@@ -26,6 +28,35 @@ const (
 	TransmissionTransparent = 0
 	TransmissionFixed       = 1
 )
+
+const (
+	StatusOK         = "AT_OK"
+	StatusParamError = "AT_PARAM_ERROR"
+	StatusNVSError   = "AT_NVS_ERROR"
+	StatusAuthError  = "AT_AUTH_ERR"
+	StatusError      = "AT_ERROR"
+)
+
+var terminalStatuses = []string{
+	StatusOK,
+	StatusParamError,
+	StatusNVSError,
+	StatusAuthError,
+	StatusError,
+}
+
+// ATError reports a documented non-OK AT command status.
+type ATError struct {
+	Status   string
+	Response string
+}
+
+func (e *ATError) Error() string {
+	if e.Response == "" {
+		return e.Status
+	}
+	return fmt.Sprintf("%s: %s", e.Status, e.Response)
+}
 
 // Options configures an EWM22A serial connection.
 type Options struct {
@@ -78,7 +109,7 @@ func Open(portName string, opts Options) (*EWM22A, error) {
 		return nil, fmt.Errorf("failed to open serial port %s: %w", portName, err)
 	}
 
-	if err := port.SetReadTimeout(opts.Timeout); err != nil {
+	if err := port.SetReadTimeout(readPoll); err != nil {
 		port.Close()
 		return nil, fmt.Errorf("failed to set read timeout: %w", err)
 	}
@@ -154,7 +185,7 @@ func (e *EWM22A) Reopen() error {
 	if err != nil {
 		return fmt.Errorf("failed to reopen serial port %s: %w", e.portName, err)
 	}
-	if err := port.SetReadTimeout(e.timeout); err != nil {
+	if err := port.SetReadTimeout(readPoll); err != nil {
 		port.Close()
 		return fmt.Errorf("failed to set read timeout: %w", err)
 	}
@@ -168,7 +199,10 @@ func (e *EWM22A) write(data []byte) error {
 	if e.debug {
 		log.Printf("[TX] %x", data)
 	}
-	_, err := e.port.Write(data)
+	n, err := e.port.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
@@ -217,7 +251,10 @@ func (e *EWM22A) ReadUntil(expected string) (string, error) {
 	return e.readUntil(expected, e.timeout)
 }
 
-// Command sends one UART AT command. EWM22A UART AT commands do not include CRLF.
+// Command sends one UART AT command and returns its response payload.
+// EWM22A UART AT commands do not include CRLF. Successful query and setter
+// commands usually return one or more payload lines followed by AT_OK; this
+// method strips the terminal status and returns only the payload.
 func (e *EWM22A) Command(command string) (string, error) {
 	if strings.ContainsAny(command, "\r\n\t ") {
 		return "", fmt.Errorf("AT command contains unsupported whitespace: %q", command)
@@ -225,7 +262,15 @@ func (e *EWM22A) Command(command string) (string, error) {
 	if err := e.WriteString(command); err != nil {
 		return "", err
 	}
-	return e.ReadUntil("AT_OK")
+	response, status, err := e.readATResponse(e.timeout)
+	payload := payloadFromATResponse(command, response, status)
+	if err != nil {
+		return payload, err
+	}
+	if status != StatusOK {
+		return payload, &ATError{Status: status, Response: payload}
+	}
+	return payload, nil
 }
 
 // SetMode sets the module working mode. The module reboots after this command.
@@ -283,7 +328,7 @@ func (e *EWM22A) SetKey(key int) (string, error) {
 	if err := checkRange("key", key, 0, 65535); err != nil {
 		return "", err
 	}
-	return e.setInt("KEY", key)
+	return e.Command(fmt.Sprintf("AT+KEY=%d", key))
 }
 
 // SetRate sets the LoRa air-rate index, 0..7.
@@ -363,7 +408,15 @@ func (e *EWM22A) SetDelay(delayMS int) (string, error) {
 }
 
 func (e *EWM22A) setInt(name string, value int) (string, error) {
-	return e.Command(fmt.Sprintf("AT+%s=%d", name, value))
+	response, err := e.Command(fmt.Sprintf("AT+%s=%d", name, value))
+	if err != nil {
+		return response, err
+	}
+	expected := fmt.Sprint(value)
+	if response != expected {
+		return response, fmt.Errorf("AT+%s returned %q, expected %q", name, response, expected)
+	}
+	return response, nil
 }
 
 func (e *EWM22A) setBool(name string, enabled bool) (string, error) {
@@ -379,6 +432,63 @@ func checkRange(name string, value, minValue, maxValue int) error {
 		return fmt.Errorf("%s must be %d..%d, got %d", name, minValue, maxValue, value)
 	}
 	return nil
+}
+
+func (e *EWM22A) readATResponse(timeout time.Duration) (response string, status string, err error) {
+	var buf strings.Builder
+	readBuf := make([]byte, readBufSize)
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		n, readErr := e.port.Read(readBuf)
+		if n > 0 {
+			chunk := string(readBuf[:n])
+			buf.WriteString(chunk)
+			if e.debug {
+				log.Printf("[RX] %q", chunk)
+			}
+			if status := findTerminalStatus(buf.String()); status != "" {
+				return buf.String(), status, nil
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return buf.String(), "", fmt.Errorf("read error: %w", readErr)
+		}
+		if n == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	return buf.String(), "", fmt.Errorf("timeout waiting for AT response, got: %q", buf.String())
+}
+
+func findTerminalStatus(response string) string {
+	for _, status := range terminalStatuses {
+		if strings.Contains(response, status) {
+			return status
+		}
+	}
+	return ""
+}
+
+func payloadFromATResponse(command, response, status string) string {
+	withoutStatus := strings.Replace(response, status, "", 1)
+	normalized := strings.ReplaceAll(withoutStatus, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+
+	var lines []string
+	for _, line := range strings.Split(normalized, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == command {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ReadFor reads whatever arrives for up to the given duration.
