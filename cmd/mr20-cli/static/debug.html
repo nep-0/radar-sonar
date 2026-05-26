@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MR20 Debug</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --ink:#e5e7eb; --muted:#9ca3af; --line:#334155; --ok:#10b981; --bad:#ef4444; }
+    * { box-sizing: border-box; }
+    body { margin:0; padding:20px; color:var(--ink); background:linear-gradient(180deg,#0b1222 0%,var(--bg) 100%); font:14px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .controls,.row { display:grid; gap:12px; margin-bottom:12px; }
+    .controls { grid-template-columns: 180px 100px 1fr; align-items:center; }
+    .row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card { background:rgba(17,24,39,.92); border:1px solid var(--line); border-radius:10px; padding:12px; }
+    .k { color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:.04em; }
+    .v { font-size:20px; font-weight:700; }
+    input,button { border-radius:8px; border:1px solid var(--line); background:#020617; color:var(--ink); font:inherit; padding:7px 9px; }
+    button { background:#1d4ed8; border:0; cursor:pointer; }
+    canvas,pre { width:100%; background:#020617; border:1px solid var(--line); border-radius:10px; }
+    canvas { display:block; }
+    pre { margin:0; padding:12px; max-height:38vh; overflow:auto; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="controls">
+      <label>Poll ms <input id="interval" type="number" min="200" step="100" value="1000"></label>
+      <button id="apply">Apply</button>
+      <div id="net" class="k">starting</div>
+    </div>
+
+    <div class="row">
+      <div class="card"><div class="k">Targets</div><div id="targetCount" class="v">-</div></div>
+      <div class="card"><div class="k">Object Count</div><div id="objectCount" class="v">-</div></div>
+      <div class="card"><div class="k">Heartbeat</div><div id="heartbeat" class="v">-</div></div>
+      <div class="card"><div class="k">RTT</div><div id="rtt" class="v">-</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px;">
+      <div class="k">Radar Graph (meters)</div>
+      <canvas id="graph" width="980" height="540"></canvas>
+      <div class="k" style="margin-top:8px;">Green: within 5m (OK), Red: out of 5m</div>
+    </div>
+
+    <div class="card"><pre id="raw">waiting...</pre></div>
+  </div>
+
+  <script>
+    const el = {
+      interval: document.getElementById('interval'),
+      apply: document.getElementById('apply'),
+      net: document.getElementById('net'),
+      targetCount: document.getElementById('targetCount'),
+      objectCount: document.getElementById('objectCount'),
+      heartbeat: document.getElementById('heartbeat'),
+      rtt: document.getElementById('rtt'),
+      raw: document.getElementById('raw'),
+      graph: document.getElementById('graph')
+    };
+
+    let timer = null;
+    let intervalMs = 1000;
+    const okRangeM = 5;
+    const maxRangeM = 8;
+
+    function draw(targets) {
+      const c = el.graph;
+      const g = c.getContext('2d');
+      const w = c.width;
+      const h = c.height;
+      const cx = w / 2;
+      const cy = h / 2;
+      const margin = 36;
+      const r = Math.min(w, h) / 2 - margin;
+      const scale = r / maxRangeM;
+
+      g.clearRect(0, 0, w, h);
+      g.strokeStyle = '#334155';
+      g.lineWidth = 1;
+      for (let i = 1; i <= 4; i += 1) {
+        g.beginPath();
+        g.arc(cx, cy, (r * i) / 4, 0, Math.PI * 2);
+        g.stroke();
+      }
+
+      g.strokeStyle = '#475569';
+      g.beginPath();
+      g.moveTo(margin, cy); g.lineTo(w - margin, cy);
+      g.moveTo(cx, margin); g.lineTo(cx, h - margin);
+      g.stroke();
+
+      g.strokeStyle = '#10b981';
+      g.lineWidth = 2;
+      g.beginPath();
+      g.arc(cx, cy, okRangeM * scale, 0, Math.PI * 2);
+      g.stroke();
+
+      g.fillStyle = '#e5e7eb';
+      g.fillRect(cx - 2, cy - 8, 4, 16);
+      g.fillRect(cx - 8, cy - 2, 16, 4);
+
+      for (const t of (Array.isArray(targets) ? targets : [])) {
+        // MR20 uses longitudinal as front/back and lateral as left/right.
+        // Plot front as up (+Y on radar => -screen Y), lateral as horizontal.
+        const longM = Number(t?.longitudinal_distance_m) || 0;
+        const latM = Number(t?.lateral_distance_m) || 0;
+        const d = Math.hypot(longM, latM);
+        const px = cx + latM * scale;
+        const py = cy - longM * scale;
+        g.beginPath();
+        g.fillStyle = d <= okRangeM ? '#10b981' : '#ef4444';
+        g.arc(px, py, 6, 0, Math.PI * 2);
+        g.fill();
+      }
+    }
+
+    async function poll() {
+      const start = performance.now();
+      try {
+        const res = await fetch('/status', { cache: 'no-store' });
+        const rtt = Math.round(performance.now() - start);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+
+        const data = await res.json();
+        el.targetCount.textContent = data?.target_count ?? '-';
+        el.objectCount.textContent = data?.object_count ?? '-';
+        el.heartbeat.textContent = data?.heartbeat || '-';
+        el.rtt.textContent = rtt + ' ms';
+        el.raw.textContent = JSON.stringify(data, null, 2);
+        draw(data?.targets || []);
+        el.net.textContent = data?.last_error ? ('warn: ' + data.last_error) : 'ok';
+      } catch (err) {
+        el.net.textContent = 'error: ' + err.message;
+      }
+    }
+
+    function restart() {
+      if (timer) clearInterval(timer);
+      poll();
+      timer = setInterval(poll, intervalMs);
+    }
+
+    el.apply.addEventListener('click', () => {
+      const n = Number(el.interval.value);
+      if (!Number.isFinite(n) || n < 200) return;
+      intervalMs = n;
+      restart();
+    });
+
+    restart();
+  </script>
+</body>
+</html>

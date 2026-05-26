@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,12 +17,14 @@ import (
 	"time"
 
 	"radar-sonar/ewm22a"
+	"radar-sonar/mr20"
 	"radar-sonar/readingcache"
 	"radar-sonar/repl"
 )
 
 const (
 	microPythonPort = "/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_e663b0359723542c-if00"
+	mr20Port        = "/dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0006-if00"
 	ewm22aPort      = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 	httpAddr        = "0.0.0.0:8080"
 	pollInterval    = 1 * time.Second
@@ -36,6 +39,36 @@ const (
 type replClient struct {
 	mu  sync.Mutex
 	raw *repl.MicroPythonREPL
+}
+
+type radarState struct {
+	mu       sync.RWMutex
+	obstacle string
+	targets  []readingcache.RadarTarget
+	lastErr  string
+}
+
+func newRadarState() *radarState {
+	return &radarState{
+		obstacle: "left",
+		targets:  []readingcache.RadarTarget{},
+	}
+}
+
+func (r *radarState) set(obstacle string, targets []readingcache.RadarTarget, lastErr string) {
+	r.mu.Lock()
+	r.obstacle = obstacle
+	r.targets = targets
+	r.lastErr = lastErr
+	r.mu.Unlock()
+}
+
+func (r *radarState) get() (string, []readingcache.RadarTarget, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]readingcache.RadarTarget, len(r.targets))
+	copy(out, r.targets)
+	return r.obstacle, out, r.lastErr
 }
 
 func (r *replClient) exec(code string) (string, string, error) {
@@ -54,13 +87,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client, err := openClient()
+	// Sonar board is temporarily unavailable; keep running with radar-only data.
+
+	radar, err := mr20.New(mr20Port, mr20.DefaultBaud, 300*time.Millisecond, false)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
-		if cerr := client.close(); cerr != nil {
-			log.Printf("close repl: %v", cerr)
+		if cerr := radar.Close(); cerr != nil {
+			log.Printf("close mr20: %v", cerr)
 		}
 	}()
 
@@ -75,10 +110,12 @@ func main() {
 	}()
 
 	state := readingcache.New(readingcache.Snapshot{LastError: "not yet polled"})
+	radarData := newRadarState()
 
 	alerts := make(chan string, alertQueueSize)
 	go alertLoop(ctx, alertClient, alerts)
-	go pollLoop(ctx, client, alerts, state)
+	go radarLoop(ctx, radar, radarData)
+	go pollLoopNoSonar(ctx, radarData, state)
 
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -160,7 +197,7 @@ func configureLoRa(client *ewm22a.EWM22A) error {
 	return nil
 }
 
-func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, state *readingcache.Cache) {
+func pollLoop(ctx context.Context, client *replClient, radarData *radarState, alerts chan<- string, state *readingcache.Cache) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -170,7 +207,7 @@ func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, sta
 	)
 
 	for {
-		currentStatus, ok := updateOnce(client, state)
+		currentStatus, ok := updateOnce(client, radarData, state)
 		if ok {
 			if havePreviousStatus && previousStatus == "overrange" && currentStatus == "normal" {
 				queueAlert(alerts)
@@ -187,10 +224,33 @@ func pollLoop(ctx context.Context, client *replClient, alerts chan<- string, sta
 	}
 }
 
-func updateOnce(client *replClient, state *readingcache.Cache) (string, bool) {
+func pollLoopNoSonar(ctx context.Context, radarData *radarState, state *readingcache.Cache) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		obstacle, radarTargets, radarErr := radarData.get()
+		state.Set(readingcache.Snapshot{
+			Height:    0,
+			Obstacle:  obstacle,
+			Sonar:     readingcache.SonarData{HeightMM: 0, Status: "unknown"},
+			Radar:     readingcache.RadarData{TargetCount: len(radarTargets), Targets: radarTargets},
+			UpdatedAt: time.Now().UTC(),
+			LastError: radarErr,
+		})
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func updateOnce(client *replClient, radarData *radarState, state *readingcache.Cache) (string, bool) {
 	code := strings.Join([]string{
 		"import json",
-		"print(json.dumps({\"height\": get_height(), \"sonar_status\": get_sonar_status(), \"obstacle\": get_obstacle(), \"radar_targets\": get_radar_targets()}))",
+		"print(json.dumps({\"height\": get_height(), \"sonar_status\": get_sonar_status()}))",
 	}, "\n")
 
 	stdout, stderr, err := client.exec(code)
@@ -207,10 +267,8 @@ func updateOnce(client *replClient, state *readingcache.Cache) (string, bool) {
 	}
 
 	var payload struct {
-		Height       float64                    `json:"height"`
-		SonarStatus  string                     `json:"sonar_status"`
-		Obstacle     string                     `json:"obstacle"`
-		RadarTargets []readingcache.RadarTarget `json:"radar_targets"`
+		Height      float64 `json:"height"`
+		SonarStatus string  `json:"sonar_status"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &payload); err != nil {
 		state.Set(readingcache.Snapshot{
@@ -225,16 +283,79 @@ func updateOnce(client *replClient, state *readingcache.Cache) (string, bool) {
 	if status == "" {
 		status = "unknown"
 	}
+	obstacle, radarTargets, radarErr := radarData.get()
+	lastErr := radarErr
 
 	state.Set(readingcache.Snapshot{
 		Height:    payload.Height,
-		Obstacle:  payload.Obstacle,
+		Obstacle:  obstacle,
 		Sonar:     readingcache.SonarData{HeightMM: payload.Height, Status: status},
-		Radar:     readingcache.RadarData{TargetCount: len(payload.RadarTargets), Targets: payload.RadarTargets},
+		Radar:     readingcache.RadarData{TargetCount: len(radarTargets), Targets: radarTargets},
 		UpdatedAt: time.Now().UTC(),
-		LastError: "",
+		LastError: lastErr,
 	})
 	return status, true
+}
+
+func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
+	var (
+		targets  []readingcache.RadarTarget
+		obstacle = "left"
+		measSeen uint16
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		frame, err := radar.ReadFrame()
+		if err != nil {
+			if errors.Is(err, mr20.ErrReadTimeout) {
+				continue
+			}
+			state.set(obstacle, targets, fmt.Sprintf("mr20: %v", err))
+			continue
+		}
+
+		if status, ok := frame.ObjectStatus(); ok {
+			if status.MeasurementCount != measSeen {
+				measSeen = status.MeasurementCount
+				targets = targets[:0]
+			}
+		}
+
+		if t, ok := frame.Target(); ok {
+			rt := readingcache.RadarTarget{
+				XMM:          int(math.Round(t.LateralDistanceM * 1000)),
+				YMM:          int(math.Round(t.LongitudinalDistanceM * 1000)),
+				SpeedCMS:     int(math.Round(t.LongitudinalVelocityMPS * 100)),
+				ResolutionMM: 0,
+			}
+			targets = append(targets, rt)
+
+			nearest := targets[0]
+			nearestDist := math.Hypot(float64(nearest.XMM), float64(nearest.YMM))
+			for _, candidate := range targets[1:] {
+				dist := math.Hypot(float64(candidate.XMM), float64(candidate.YMM))
+				if dist < nearestDist {
+					nearest = candidate
+					nearestDist = dist
+				}
+			}
+			if nearest.XMM >= 0 {
+				obstacle = "right"
+			} else {
+				obstacle = "left"
+			}
+		}
+
+		out := make([]readingcache.RadarTarget, len(targets))
+		copy(out, targets)
+		state.set(obstacle, out, "")
+	}
 }
 
 func queueAlert(alerts chan<- string) {
