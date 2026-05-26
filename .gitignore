@@ -1,4 +1,6 @@
 *.txt
+*.pdf
+MR20-Python3.py
 
 build
 *.exe
