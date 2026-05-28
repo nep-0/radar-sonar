@@ -32,8 +32,8 @@ const (
 	alertPayload    = "SONAR_OVERRANGE_TO_NORMAL_ALERT"
 	alertQueueSize  = 8
 
-	loRaAddress   = 0xFFFF
-	loRaChannel   = 0
+	loRaAddress   = 0x0002
+	loRaChannel   = 20
 	loRaNetworkID = 0
 )
 
@@ -88,7 +88,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Sonar board is temporarily unavailable; keep running with radar-only data.
+	client, err := openClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if cerr := client.close(); cerr != nil {
+			log.Printf("close repl: %v", cerr)
+		}
+	}()
 
 	radar, err := mr20.New(mr20Port, mr20.DefaultBaud, 300*time.Millisecond, false)
 	if err != nil {
@@ -116,7 +124,7 @@ func main() {
 	alerts := make(chan string, alertQueueSize)
 	go alertLoop(ctx, alertClient, alerts)
 	go radarLoop(ctx, radar, radarData)
-	go pollLoopNoSonar(ctx, radarData, state)
+	go pollLoop(ctx, client, radarData, alerts, state)
 
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
