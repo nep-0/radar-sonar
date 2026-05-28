@@ -29,7 +29,7 @@ const (
 	httpAddr        = "0.0.0.0:8080"
 	pollInterval    = 1 * time.Second
 	obstacleHold    = 1 * time.Second
-	alertPayload    = "SONAR_OVERRANGE_TO_NORMAL_ALERT"
+	alertPayload    = "Team 24 Redstone"
 	alertQueueSize  = 8
 
 	loRaAddress   = 0x0002
@@ -47,6 +47,28 @@ type radarState struct {
 	obstacle string
 	targets  []readingcache.RadarTarget
 	lastErr  string
+}
+
+type elapsedClock struct {
+	mu    sync.RWMutex
+	start time.Time
+}
+
+func newElapsedClock() *elapsedClock {
+	return &elapsedClock{start: time.Now()}
+}
+
+func (c *elapsedClock) reset() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.start = time.Now()
+	return c.start
+}
+
+func (c *elapsedClock) elapsed() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return time.Since(c.start)
 }
 
 func newRadarState() *radarState {
@@ -120,14 +142,28 @@ func main() {
 
 	state := readingcache.New(readingcache.Snapshot{LastError: "not yet polled"})
 	radarData := newRadarState()
+	clock := newElapsedClock()
 
 	alerts := make(chan string, alertQueueSize)
 	go alertLoop(ctx, alertClient, alerts)
 	go radarLoop(ctx, radar, radarData)
-	go pollLoop(ctx, client, radarData, alerts, state)
+	go pollLoop(ctx, client, radarData, alerts, state, clock)
 
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	mux.HandleFunc("/reset-time", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		resetAt := clock.reset().UTC()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"reset_at": resetAt.Format(time.RFC3339Nano),
+			"status":   "ok",
+		})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		cleanPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
 		switch cleanPath {
@@ -206,7 +242,7 @@ func configureLoRa(client *ewm22a.EWM22A) error {
 	return nil
 }
 
-func pollLoop(ctx context.Context, client *replClient, radarData *radarState, alerts chan<- string, state *readingcache.Cache) {
+func pollLoop(ctx context.Context, client *replClient, radarData *radarState, alerts chan<- string, state *readingcache.Cache, clock *elapsedClock) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -219,7 +255,7 @@ func pollLoop(ctx context.Context, client *replClient, radarData *radarState, al
 		currentStatus, ok := updateOnce(client, radarData, state)
 		if ok {
 			if havePreviousStatus && previousStatus == "overrange" && currentStatus == "normal" {
-				queueAlert(alerts)
+				queueAlert(alerts, clock.elapsed())
 			}
 			previousStatus = currentStatus
 			havePreviousStatus = true
@@ -387,8 +423,14 @@ func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
 	}
 }
 
-func queueAlert(alerts chan<- string) {
-	message := fmt.Sprintf("%s %s", time.Now().Format("2006-01-02 15:04:05"), alertPayload)
+func queueAlert(alerts chan<- string, elapsed time.Duration) {
+	totalSeconds := int(elapsed.Seconds())
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+	message := fmt.Sprintf("%s %s elapsed_mmss=%02d:%02d\n", time.Now().Format("2006-01-02 15:04:05"), alertPayload, minutes, seconds)
 	select {
 	case alerts <- message:
 	default:
