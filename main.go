@@ -28,6 +28,7 @@ const (
 	ewm22aPort      = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 	httpAddr        = "0.0.0.0:8080"
 	pollInterval    = 1 * time.Second
+	obstacleHold    = 1 * time.Second
 	alertPayload    = "SONAR_OVERRANGE_TO_NORMAL_ALERT"
 	alertQueueSize  = 8
 
@@ -299,9 +300,11 @@ func updateOnce(client *replClient, radarData *radarState, state *readingcache.C
 
 func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
 	var (
-		targets  []readingcache.RadarTarget
-		obstacle = "left"
-		measSeen uint16
+		targets    []readingcache.RadarTarget
+		obstacle   = "unknown"
+		lastSide   = "unknown"
+		lastSideAt time.Time
+		measSeen   uint16
 	)
 
 	for {
@@ -324,10 +327,18 @@ func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
 			if status.MeasurementCount != measSeen {
 				measSeen = status.MeasurementCount
 				targets = targets[:0]
+				if lastSide != "unknown" && time.Since(lastSideAt) < obstacleHold {
+					obstacle = lastSide
+				} else {
+					obstacle = "unknown"
+				}
 			}
 		}
 
 		if t, ok := frame.Target(); ok {
+			if t.RangeM >= 1.0 {
+				continue
+			}
 			rt := readingcache.RadarTarget{
 				XMM:          int(math.Round(t.LateralDistanceM * 1000)),
 				YMM:          int(math.Round(t.LongitudinalDistanceM * 1000)),
@@ -349,6 +360,16 @@ func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
 				obstacle = "right"
 			} else {
 				obstacle = "left"
+			}
+			lastSide = obstacle
+			lastSideAt = time.Now()
+		}
+
+		if len(targets) == 0 {
+			if lastSide != "unknown" && time.Since(lastSideAt) < obstacleHold {
+				obstacle = lastSide
+			} else {
+				obstacle = "unknown"
 			}
 		}
 
