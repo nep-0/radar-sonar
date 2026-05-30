@@ -380,7 +380,7 @@ func radarLoop(ctx context.Context, radar *mr20.MR20, state *radarState) {
 		}
 
 		if t, ok := frame.Target(); ok {
-			if t.RangeM >= 1.0 {
+			if t.RangeM >= 0.8 {
 				continue
 			}
 			rt := readingcache.RadarTarget{
